@@ -41,6 +41,8 @@ export class RedisStore extends EventEmitter {
 	// Local Memory Trackers
 	private localFallbackCache: LRUCache<string, InMemoryBucket>;
 
+	private isReloadingScript = false;
+
 	constructor(client: RedisClientType, options: RedisStoreOptions = {}) {
 		super();
 		this.client = client;
@@ -109,12 +111,24 @@ export class RedisStore extends EventEmitter {
 	}
 
 	private _initializeScript(): void {
-		this.sha = this.client.scriptLoad(lua_script).catch((err) => {
-			this.emit('error', new Error(`Failed to prime Lua footprint on startup: ${err.message}`));
-			// Return an empty string so the runtime pipeline can catch the failure 
-			// via NOSCRIPT rather than crashing the constructor process loop completely
-			return '';
-		});
+		// If a script load is already in flight, exit immediately.
+		// The caller will simply await the already-updating this.sha
+		if (this.isReloadingScript) {
+			return;
+		}
+
+		this.isReloadingScript = true;
+
+		this.sha = this.client.scriptLoad(lua_script)
+			.then((sha) => {
+				this.isReloadingScript = false;
+				return sha;
+			})
+			.catch((err) => {
+				this.isReloadingScript = false;
+				this.emit('error', new Error(`Failed to prime Lua footprint: ${err.message}`));
+				return '';
+			});
 	}
 
 	public async increment(key: string, config: IncrementConfig, reqTimeStamp: number, isRetry = false): Promise<RateLimitResult> {
@@ -133,6 +147,10 @@ export class RedisStore extends EventEmitter {
 			} else {
 				return this._handleFallbackRouting(key, config);
 			}
+		} else if (this.circuitState === 'HALF-OPEN') {
+			// A probe is already in flight. Route all concurrent requests to fallback
+			// until the probe either closes the circuit or trips it back to OPEN.
+			return this._handleFallbackRouting(key, config);
 		}
 
 		// LAYER 3: The Stopwatch Race against Hidden Congestion
